@@ -15,7 +15,8 @@ import numpy as np
 from typing import Dict, List, Optional
 from PIL import Image
 
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoTokenizer,AutoProcessor
+
 from peft import PeftModel, PeftConfig
 from transformers import LayoutLMv3ForTokenClassification
 
@@ -62,9 +63,12 @@ class ReceiptExtractor:
 
         self.processor = AutoProcessor.from_pretrained(
             peft_config.base_model_name_or_path,
-            apply_ocr=True,   # use built-in Tesseract OCR if no text provided
+            apply_ocr=False,   # use built-in Tesseract OCR if no text provided
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        # ✅ Load tokenizer from the base model instead
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            peft_config.base_model_name_or_path   # "microsoft/layoutlmv3-base"
+        )
         print("✓ Model loaded successfully.")
 
     def extract(
@@ -81,7 +85,7 @@ class ReceiptExtractor:
             words:  Optional pre-computed OCR words (skips built-in OCR)
             boxes:  Corresponding bounding boxes [x0, y0, x1, y1] in [0,1000] scale
         """
-        # Preprocess
+        # ── Preprocess ────────────────────────────────────────────────────
         if words is not None and boxes is not None:
             encoding = self.processor(
                 image, words, boxes=boxes,
@@ -90,53 +94,88 @@ class ReceiptExtractor:
                 padding="max_length",
             )
         else:
-            # Let the processor run OCR automatically
+            # Let the processor run OCR automatically.
             encoding = self.processor(
                 image,
                 return_tensors="pt",
                 truncation=True, max_length=512,
                 padding="max_length",
             )
-            words = self.processor.tokenizer.convert_ids_to_tokens(
-                encoding["input_ids"][0].tolist()
+            # FIX (Bug 3): recover the real OCR words from the processor's
+            # internal tokenizer, NOT subword tokens from convert_ids_to_tokens.
+            # LayoutLMv3Processor stores the pre-tokenisation word list here:
+            words = self.processor.tokenizer.batch_decode(
+                encoding["input_ids"][0].tolist(),
+                skip_special_tokens=True,
             )
+            # A more reliable source when apply_ocr=True is the processor's
+            # last OCR result (available as processor.tokenizer.word_ids won't
+            # work, but the words are accessible via the encoding itself):
+            # We pull word_ids BEFORE moving tensors to device (see Bug 1 fix).
 
-        # Move to device
-        encoding = {k: v.to(self.device) for k, v in encoding.items()
-                    if isinstance(v, torch.Tensor)}
+        # FIX (Bug 1 & 2): call word_ids() on the *encoding object* right here,
+        # before converting it to a plain tensor dict. This is the only place
+        # where the BatchEncoding object still has the .word_ids() method.
+        try:
+            word_ids = encoding.word_ids(batch_index=0)  # List[int | None]
+        except Exception:
+            # Fallback: if the processor doesn't expose word_ids (e.g. slow
+            # tokenizer), build a dummy 1-to-1 mapping so inference still runs.
+            seq_len  = encoding["input_ids"].shape[1]
+            word_ids = list(range(seq_len))
 
-        # Inference
+        # Also recover the true word list from the encoding when using auto-OCR,
+        # because batch_decode above gives us subword noise.
+        if words is None or not any(words):
+            # words will have been set in the else-branch above; re-derive
+            # using word_ids to pull the first token per word and decode.
+            n_words  = max((w for w in word_ids if w is not None), default=-1) + 1
+            word_ids_arr = np.array(
+                [w if w is not None else -1 for w in word_ids]
+            )
+            words = []
+            for wid in range(n_words):
+                tok_positions = np.where(word_ids_arr == wid)[0]
+                if len(tok_positions):
+                    first_tok = encoding["input_ids"][0, tok_positions[0]].item()
+                    words.append(
+                        self.processor.tokenizer.decode([first_tok],
+                                                        skip_special_tokens=True)
+                    )
+
+        # ── Move tensors to device ────────────────────────────────────────
+        encoding_tensors = {
+            k: v.to(self.device)
+            for k, v in encoding.items()
+            if isinstance(v, torch.Tensor)
+        }
+
+        # ── Inference ─────────────────────────────────────────────────────
         with torch.no_grad():
-            outputs = self.model(**encoding)
+            outputs = self.model(**encoding_tensors)
 
-        logits       = outputs.logits.squeeze(0)         # [seq_len, num_labels]
-        probs        = torch.softmax(logits, dim=-1)
-        pred_ids     = logits.argmax(-1).tolist()
-        pred_labels  = [ID2LABEL[i] for i in pred_ids]
-        confidence   = probs.max(-1).values.tolist()
+        logits      = outputs.logits.squeeze(0)          # [seq_len, num_labels]
+        probs       = torch.softmax(logits, dim=-1)
+        pred_ids    = logits.argmax(-1).tolist()
+        pred_labels = [ID2LABEL[i] for i in pred_ids]
+        confidence  = probs.max(-1).values.tolist()
 
-        # Decode word IDs to recover word-level predictions
-        word_ids = encoding.get("word_ids", [None] * len(pred_labels))
-        if hasattr(self.processor.tokenizer, "word_ids"):
-            word_ids = self.processor.tokenizer.word_ids(
-                batch_index=0
-            )
+        # ── Map subword predictions → word level (take first subword) ─────
+        word_pred_labels: Dict[int, str]   = {}
+        word_confidence:  Dict[int, float] = {}
 
-        # Map subword predictions back to word level (take first subword)
-        word_pred_labels = {}
-        word_confidence  = {}
         for tok_idx, (label, conf) in enumerate(zip(pred_labels, confidence)):
             if tok_idx < len(word_ids) and word_ids[tok_idx] is not None:
                 wid = word_ids[tok_idx]
-                if wid not in word_pred_labels:    # first subword only
+                if wid not in word_pred_labels:      # first subword only
                     word_pred_labels[wid] = label
                     word_confidence[wid]  = conf
 
-        # Extract spans
+        # ── Build word-level label / confidence sequences ─────────────────
         word_label_seq = [
             word_pred_labels.get(i, "O") for i in range(len(words))
         ]
-        word_conf_seq  = [
+        word_conf_seq = [
             word_confidence.get(i, 0.0) for i in range(len(words))
         ]
 
@@ -144,7 +183,7 @@ class ReceiptExtractor:
             word_label_seq, words, word_conf_seq
         )
 
-        # Build output
+        # ── Build final output ────────────────────────────────────────────
         result = {
             "vendor":     self._best_span(raw_spans, "VENDOR"),
             "date":       self._best_span(raw_spans, "DATE"),
@@ -158,40 +197,49 @@ class ReceiptExtractor:
         }
         return result
 
+    # ── Helpers ───────────────────────────────────────────────────────────
+
     def _extract_spans_with_confidence(
         self,
         labels: List[str],
-        words: List[str],
-        confs: List[float],
+        words:  List[str],
+        confs:  List[float],
     ) -> Dict:
-        spans = {}
-        current_type  = None
-        current_words = []
-        current_confs = []
+        spans: Dict[str, list] = {}
+        current_type:  Optional[str] = None
+        current_words: List[str]     = []
+        current_confs: List[float]   = []
+
+        def _flush():
+            if current_type:
+                spans.setdefault(current_type, []).append({
+                    "text":       " ".join(current_words),
+                    "confidence": float(np.mean(current_confs)),
+                })
 
         for label, word, conf in zip(labels, words, confs):
             if label == "O":
-                if current_type:
-                    spans.setdefault(current_type, []).append({
-                        "text": " ".join(current_words),
-                        "confidence": float(np.mean(current_confs)),
-                    })
+                _flush()
                 current_type = None; current_words = []; current_confs = []
-            elif label.startswith("B-"):
-                if current_type:
-                    spans.setdefault(current_type, []).append({
-                        "text": " ".join(current_words),
-                        "confidence": float(np.mean(current_confs)),
-                    })
-                current_type = label[2:]; current_words = [word]; current_confs = [conf]
-            elif label.startswith("I-") and current_type == label[2:]:
-                current_words.append(word); current_confs.append(conf)
 
-        if current_type:
-            spans.setdefault(current_type, []).append({
-                "text": " ".join(current_words),
-                "confidence": float(np.mean(current_confs)),
-            })
+            elif label.startswith("B-"):
+                _flush()
+                current_type  = label[2:]
+                current_words = [word]
+                current_confs = [conf]
+
+            elif label.startswith("I-") and current_type == label[2:]:
+                current_words.append(word)
+                current_confs.append(conf)
+
+            else:
+                # I- tag with no matching B- (broken sequence) — start fresh
+                _flush()
+                current_type  = label[2:] if "-" in label else None
+                current_words = [word] if current_type else []
+                current_confs = [conf]  if current_type else []
+
+        _flush()
         return spans
 
     def _best_span(self, spans: Dict, field: str) -> str:

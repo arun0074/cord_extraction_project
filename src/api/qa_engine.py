@@ -34,7 +34,7 @@ class QAEngine:
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if api_key and GEMINI_AVAILABLE:
             genai.configure(api_key=api_key)
-            self.llm = genai.GenerativeModel("gemini-1.5-flash")
+            self.llm = genai.GenerativeModel("gemini-2.5-flash-lite")
             self.use_llm = True
             print("✓ QA Engine: using Gemini 1.5 Flash")
         else:

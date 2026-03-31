@@ -126,7 +126,7 @@ The system reports metrics at **three levels**:
 # In a Colab cell:
 !git clone https://github.com/your-repo/cord-extraction
 %cd cord-extraction
-!pip install -r requirements_notebook.txt -q
+!pip install -r notebooks/requirements_notebook.txt -q
 
 # Step 1: Analyse dataset
 !python notebooks/01_dataset_analysis.py
@@ -146,7 +146,7 @@ git clone https://github.com/your-repo/cord-extraction
 cd cord-extraction
 
 python -m venv venv && source venv/bin/activate
-pip install -r requirements_notebook.txt
+pip install -r notebooks/requirements_notebook.txt
 
 # (Optional) Set Gemini API key for LLM-based QA
 export GEMINI_API_KEY="your-key-here"

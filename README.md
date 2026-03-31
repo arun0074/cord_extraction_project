@@ -126,14 +126,14 @@ The system reports metrics at **three levels**:
 # In a Colab cell:
 !git clone https://github.com/your-repo/cord-extraction
 %cd cord-extraction
-!pip install -r requirements.txt -q
+!pip install -r requirements_notebook.txt -q
 
 # Step 1: Analyse dataset
 !python notebooks/01_dataset_analysis.py
 
 # Step 2: Train
 !python notebooks/02_model_selection_and_training.py
-
+!pip install -r requirements.txt -q
 # Step 3: Launch API + UI (two separate cells)
 !uvicorn src.api.app:app --host 0.0.0.0 --port 8000 &
 !python src/ui/app.py   # opens public Gradio URL
@@ -146,7 +146,7 @@ git clone https://github.com/your-repo/cord-extraction
 cd cord-extraction
 
 python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements_notebook.txt
 
 # (Optional) Set Gemini API key for LLM-based QA
 export GEMINI_API_KEY="your-key-here"
@@ -156,6 +156,7 @@ python notebooks/01_dataset_analysis.py
 python notebooks/02_model_selection_and_training.py
 
 # Start API (terminal 1)
+!pip install -r requirements.txt -q
 uvicorn src.api.app:app --host 0.0.0.0 --port 8000
 
 # Start UI (terminal 2)
